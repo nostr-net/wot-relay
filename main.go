@@ -9,6 +9,7 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -73,6 +74,11 @@ var (
 	archivedEvents      uint64
 	profileRefreshCount uint64
 	networkRefreshCount uint64
+	lastRefreshStarted  int64
+	lastRefreshEnded    int64
+	lastRefreshDuration uint64
+	lastRefreshEvents   uint64
+	lastQuarantinedSSTs uint64
 )
 
 // Mutexes for thread safety
@@ -119,6 +125,14 @@ func main() {
 	relay.Info.Version = version
 
 	appendPubkey(config.RelayPubkey)
+
+	quarantinedSSTs, err := quarantineZeroLengthBadgerFiles(config.DBPath)
+	if err != nil {
+		log.Printf("⚠️ unable to scrub badger tables before startup: %v", err)
+	} else if quarantinedSSTs > 0 {
+		atomic.StoreUint64(&lastQuarantinedSSTs, uint64(quarantinedSSTs))
+		log.Printf("🩹 quarantined %d zero-length badger table(s) before opening the database", quarantinedSSTs)
+	}
 
 	db := getDB()
 	if err := db.Init(); err != nil {
@@ -202,6 +216,7 @@ func main() {
 	mux.Handle("GET /favicon.ico", http.StripPrefix("/", static))
 
 	// Add debug endpoints
+	mux.HandleFunc("GET /metrics", metricsHandler)
 	mux.HandleFunc("GET /debug/stats", debugStatsHandler)
 	mux.HandleFunc("GET /debug/goroutines", debugGoroutinesHandler)
 
@@ -229,7 +244,7 @@ func main() {
 	log.Println("   http://localhost:3334/debug/pprof/ (CPU/memory profiling)")
 	log.Println("   http://localhost:3334/debug/stats (application stats)")
 	log.Println("   http://localhost:3334/debug/goroutines (goroutine info)")
-	err := http.ListenAndServe(":3334", relay)
+	err = http.ListenAndServe(":3334", relay)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -407,18 +422,24 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay) {
 	runTrustNetworkRefresh := func() {
 		atomic.AddUint64(&networkRefreshCount, 1)
 		start := time.Now()
+		atomic.StoreInt64(&lastRefreshStarted, start.Unix())
 
 		// Build new networks in temporary variables to avoid disrupting the active network
 		var newOneHopNetwork []string
 		newOneHopNetworkSet := make(map[string]bool)
 		newPubkeyFollowerCount := make(map[string]int)
-
-		// Copy existing follower counts to preserve data
-		followerMutex.RLock()
-		for k, v := range pubkeyFollowerCount {
-			newPubkeyFollowerCount[k] = v
+		var newRelays []string
+		newRelaySet := make(map[string]bool)
+		appendRelaySnapshot := func(relayURL string) {
+			if len(newRelays) >= config.MaxRelays {
+				return
+			}
+			if relayURL == "" || newRelaySet[relayURL] {
+				return
+			}
+			newRelays = append(newRelays, relayURL)
+			newRelaySet[relayURL] = true
 		}
-		followerMutex.RUnlock()
 
 		timeoutCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
@@ -475,7 +496,9 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay) {
 				}
 
 				for _, relay := range ev.Event.Tags.GetAll([]string{"r"}) {
-					appendRelay(relay[1])
+					if len(relay) > 1 {
+						appendRelaySnapshot(relay[1])
+					}
 				}
 
 				if ev.Event.Kind == nostr.KindProfileMetadata {
@@ -495,11 +518,19 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay) {
 		oneHopNetworkSet = newOneHopNetworkSet
 		oneHopMutex.Unlock()
 
+		relayMutex.Lock()
+		relays = newRelays
+		relaySet = newRelaySet
+		relayMutex.Unlock()
+
 		followerMutex.Lock()
 		pubkeyFollowerCount = newPubkeyFollowerCount
 		followerMutex.Unlock()
 
 		duration := time.Since(start)
+		atomic.StoreInt64(&lastRefreshEnded, time.Now().Unix())
+		atomic.StoreUint64(&lastRefreshDuration, uint64(duration.Milliseconds()))
+		atomic.StoreUint64(&lastRefreshEvents, uint64(totalProcessed))
 		log.Printf("🫂 total network size: %d (processed %d events in %v)", len(newPubkeyFollowerCount), totalProcessed, duration)
 		relayMutex.RLock()
 		log.Println("🔗 relays discovered:", len(relays))
@@ -779,6 +810,48 @@ func getDB() badger.BadgerBackend {
 	}
 }
 
+func quarantineZeroLengthBadgerFiles(dbPath string) (int, error) {
+	entries, err := os.ReadDir(dbPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+
+	quarantineDir := filepath.Join(filepath.Dir(dbPath), filepath.Base(dbPath)+".quarantine")
+	quarantined := 0
+
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".sst" {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			return quarantined, err
+		}
+		if info.Size() != 0 {
+			continue
+		}
+
+		if err := os.MkdirAll(quarantineDir, 0o755); err != nil {
+			return quarantined, err
+		}
+
+		src := filepath.Join(dbPath, entry.Name())
+		dst := filepath.Join(quarantineDir, fmt.Sprintf("%s.zero-length.%d", entry.Name(), time.Now().Unix()))
+		if err := os.Rename(src, dst); err != nil {
+			return quarantined, err
+		}
+
+		quarantined++
+		log.Printf("🩹 moved zero-length badger table from %s to %s", src, dst)
+	}
+
+	return quarantined, nil
+}
+
 func splitAndTrim(input string) []string {
 	items := strings.Split(input, ",")
 	for i, item := range items {
@@ -880,6 +953,22 @@ func debugStatsHandler(w http.ResponseWriter, r *http.Request) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 
+	relayMutex.RLock()
+	relayCount := len(relays)
+	relayMutex.RUnlock()
+
+	trustNetworkMutex.RLock()
+	trustNetworkCount := len(trustNetwork)
+	trustNetworkMutex.RUnlock()
+
+	oneHopMutex.RLock()
+	oneHopCount := len(oneHopNetwork)
+	oneHopMutex.RUnlock()
+
+	followerMutex.RLock()
+	followerCount := len(pubkeyFollowerCount)
+	followerMutex.RUnlock()
+
 	stats := fmt.Sprintf(`Debug Statistics:
 
 Memory:
@@ -899,6 +988,11 @@ Events:
 Refreshes:
   Profile Refreshes: %d
   Network Refreshes: %d
+  Last Refresh Started: %d
+  Last Refresh Ended: %d
+  Last Refresh Duration: %d ms
+  Last Refresh Events: %d
+  Quarantined Zero-Length SSTs: %d
 
 Data Structures:
   Relays: %d
@@ -918,14 +1012,62 @@ Data Structures:
 		atomic.LoadUint64(&untrustedNotes),
 		atomic.LoadUint64(&profileRefreshCount),
 		atomic.LoadUint64(&networkRefreshCount),
-		len(relays),
-		len(trustNetwork),
-		len(oneHopNetwork),
-		len(pubkeyFollowerCount),
+		atomic.LoadInt64(&lastRefreshStarted),
+		atomic.LoadInt64(&lastRefreshEnded),
+		atomic.LoadUint64(&lastRefreshDuration),
+		atomic.LoadUint64(&lastRefreshEvents),
+		atomic.LoadUint64(&lastQuarantinedSSTs),
+		relayCount,
+		trustNetworkCount,
+		oneHopCount,
+		followerCount,
 	)
 
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write([]byte(stats))
+}
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	relayMutex.RLock()
+	relayCount := len(relays)
+	relayMutex.RUnlock()
+
+	trustNetworkMutex.RLock()
+	trustNetworkCount := len(trustNetwork)
+	trustNetworkMutex.RUnlock()
+
+	oneHopMutex.RLock()
+	oneHopCount := len(oneHopNetwork)
+	oneHopMutex.RUnlock()
+
+	followerMutex.RLock()
+	followerCount := len(pubkeyFollowerCount)
+	followerMutex.RUnlock()
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	fmt.Fprintf(w, "wot_relay_events_total %d\n", atomic.LoadUint64(&totalEvents))
+	fmt.Fprintf(w, "wot_relay_events_rejected_total %d\n", atomic.LoadUint64(&rejectedEvents))
+	fmt.Fprintf(w, "wot_relay_events_archived_total %d\n", atomic.LoadUint64(&archivedEvents))
+	fmt.Fprintf(w, "wot_relay_trusted_notes_total %d\n", atomic.LoadUint64(&trustedNotes))
+	fmt.Fprintf(w, "wot_relay_untrusted_notes_total %d\n", atomic.LoadUint64(&untrustedNotes))
+	fmt.Fprintf(w, "wot_relay_profile_refresh_total %d\n", atomic.LoadUint64(&profileRefreshCount))
+	fmt.Fprintf(w, "wot_relay_network_refresh_total %d\n", atomic.LoadUint64(&networkRefreshCount))
+	fmt.Fprintf(w, "wot_relay_last_refresh_started_unix %d\n", atomic.LoadInt64(&lastRefreshStarted))
+	fmt.Fprintf(w, "wot_relay_last_refresh_ended_unix %d\n", atomic.LoadInt64(&lastRefreshEnded))
+	fmt.Fprintf(w, "wot_relay_last_refresh_duration_ms %d\n", atomic.LoadUint64(&lastRefreshDuration))
+	fmt.Fprintf(w, "wot_relay_last_refresh_events %d\n", atomic.LoadUint64(&lastRefreshEvents))
+	fmt.Fprintf(w, "wot_relay_badger_quarantined_ssts_total %d\n", atomic.LoadUint64(&lastQuarantinedSSTs))
+	fmt.Fprintf(w, "wot_relay_relays %d\n", relayCount)
+	fmt.Fprintf(w, "wot_relay_trust_network %d\n", trustNetworkCount)
+	fmt.Fprintf(w, "wot_relay_one_hop_network %d\n", oneHopCount)
+	fmt.Fprintf(w, "wot_relay_followers_map %d\n", followerCount)
+	fmt.Fprintf(w, "wot_relay_go_goroutines %d\n", runtime.NumGoroutine())
+	fmt.Fprintf(w, "wot_relay_go_mem_alloc_bytes %d\n", m.Alloc)
+	fmt.Fprintf(w, "wot_relay_go_mem_sys_bytes %d\n", m.Sys)
+	fmt.Fprintf(w, "wot_relay_go_gc_cycles_total %d\n", m.NumGC)
 }
 
 func debugGoroutinesHandler(w http.ResponseWriter, r *http.Request) {
